@@ -1,0 +1,472 @@
+/*
+ * This is the implementation of <<Reinforcement Learning>> Excises 3.5
+ * Game Engine: Box2D
+ * Algorithm: Finite Markov Decision
+ * Training Objective: Try to minimize the angle of the pole in first 400 game steps. 
+ * Performance: The pole will never fall (Good~ Good~)!
+ *
+ * The objective in this task is to apply forces to a cart moving along a track
+ * so as to keep a pole hinged to the cart from falling over: A failure is said
+ * to occur if the pole falls past a given angle from vertical or if the cart
+ * runs off the track. The pole is reset to vertical after each failure. This
+ * task could be treated as episodic, where the natural episodes are the repeated
+ * attempts to balance the pole. The reward in this case could be +1 for every
+ * time step on which failure did not occur, so that the return at each time
+ * would be the number of steps until failure. In this case, successful balancing
+ * forever would mean a return of infinity. Alternatively, we could treat
+ * pole-balancing as a continuing task, using discounting. In this case the
+ * reward would be −1 on each failure and zero at all other times. The return at
+ * each time would then be related to −γK, where K is the number of time steps
+ * before failure. In either case, the return is maximized by keeping the pole
+ * balanced for as long as possible.
+ */ 
+
+#ifndef MYTEST_POLE_BALANCING_H
+#define MYTEST_POLE_BALANCING_H
+
+#include <string>
+#include <random>
+#include <memory>
+#include <iostream>
+#include <cmath>
+#include <vector>
+#include <fstream>
+#include <algorithm>
+
+#include "../b2dJson/b2dJson.h"
+
+//#define PRINT_DEBUG_INFO
+
+
+template <typename T>
+void PrintHelper(T t) {
+#ifdef PRINT_DEBUG_INFO
+  std::cout<<t;
+#endif
+}
+
+template <typename T, typename ...Args>
+void PrintHelper(T t, Args... args) {
+#ifdef PRINT_DEBUG_INFO
+  std::cout<<t;
+  PrintHelper(args...);
+#endif
+}
+
+
+template <typename ...Args>
+void Print(Args... args){
+#ifdef PRINT_DEBUG_INFO
+  PrintHelper(args...);
+  std::cout<<std::endl;
+#endif
+}
+
+template <>
+void Print(){
+#ifdef PRINT_DEBUG_INFO
+  std::cout<<std::endl;
+#endif
+}
+
+class MyTest_Pole_Balancing;
+
+class PoleAI {
+  public:
+    using Action = unsigned char;
+    union ActionTableEntry {
+      struct {
+        // car velocity
+        unsigned c_v : 6;
+        // pole angle
+        unsigned p_a : 6;
+        // pole speed
+        unsigned p_s : 6;
+        unsigned unused : 14;
+      };
+      unsigned int val;
+    };
+
+
+    static constexpr int kLvl = 60;
+    static constexpr int kTableSize = 64*64*64*3 + 1000;
+    Action action_table_[kTableSize];
+
+    float sim_hz_ = 1/60.0f;
+    float alpha_;
+    int max_explore_steps_= 400;
+    Action GetAction(MyTest_Pole_Balancing *instance);
+
+    PoleAI();
+
+    void TrainAI(int epoches, MyTest_Pole_Balancing *instance);
+    void ApplyAction(const Action &action, MyTest_Pole_Balancing *instance);
+
+    void SaveActionTable();
+    void LoadActionTable();
+  private:
+    // Run with an action until game ends or reached X steps.
+    float EvalAction(const Action &action, MyTest_Pole_Balancing *instance);
+    ActionTableEntry GetActionEntryFromInstance(MyTest_Pole_Balancing *instance);
+};  // class PoleAI
+
+
+class MyTest_Pole_Balancing : public Test {
+  public:
+    MyTest_Pole_Balancing();
+
+    // pole angle > 45 || car below platform
+    bool GameEnd() {
+      return ::abs(pole_joint_->GetJointAngle()) >= b2_pi / 4.0f || car_->GetPosition().y < 0.0f;
+    }
+
+    std::string SaveInstanceToString() {
+      // Saves world.
+      b2dJson json;
+      json.setBodyName(car_, "car");
+      json.setBodyName(ground_, "ground");
+      json.setBodyName(pole_, "pole");
+      json.setJointName(pole_joint_, "pole_joint");
+
+      return json.writeToString(m_world);
+    }
+
+    void LoadInstanceFromString( const std::string &str) {
+      b2dJson json;
+      std::string err;
+      delete m_world;
+      m_world = json.readFromString(str, err);
+      if(!err.empty()) Print("ERR: ", err);
+
+      m_destructionListener.test = this;
+      m_world->SetDestructionListener(&m_destructionListener);
+      m_world->SetContactListener(this);
+      m_world->SetDebugDraw(&g_debugDraw);
+
+      car_ = json.getBodyByName("car");
+      ground_ = json.getBodyByName("ground");
+      pole_ = json.getBodyByName("pole");
+      pole_joint_ = (b2RevoluteJoint*)json.getJointByName("pole_joint");
+    }
+
+    void PrintDebugInfo() {
+      Print("car_pos: ", car_->GetPosition().x, " ", car_->GetPosition().y);
+      Print("car_v: ", car_->GetLinearVelocity().x);
+      Print("pole_ang: ", pole_joint_->GetJointAngle() * 180.0f/ b2_pi);
+      Print("pole_spd: ", pole_->GetAngularVelocity());
+    }
+
+    void Init() {
+      // AI init
+      enable_ai_ = true;
+
+      // Init vlaues
+      float car_x = 1.0f, car_y = 0.4f;
+      b2Vec2 car_pos{0.0f, 1.0f};
+      float pole_x = 0.15f, pole_y = 2.5f;
+      car_spd_ = 0.0f;
+      spd_delta_ = 1.0f;
+
+      std::random_device rd;
+      std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+      float init_pole_torque = dist(rd);
+
+      // Platform
+      {
+        b2BodyDef bd;
+        ground_ = m_world->CreateBody(&bd);
+
+        b2Vec2 vs[6];
+        int i = 0;
+        vs[i++].Set(-100.0f, 1.0f);
+        vs[i++].Set(-90.0f, 1.0f);
+        vs[i++].Set(-90.0f, 0.0f);
+        vs[i++].Set(90.0f, 0.0f);
+        vs[i++].Set(90.0f, 1.0f);
+        vs[i++].Set(100.0f, 1.0f);
+        b2ChainShape chain_shape;
+        chain_shape.CreateChain(vs, 6);
+
+        b2FixtureDef fd;
+        fd.shape = &chain_shape;
+        fd.density = 0.0f;
+        fd.friction = 1.0f;
+        ground_->CreateFixture(&fd);
+      }
+
+      // Car
+      {
+        b2BodyDef bd;
+        bd.type = b2_dynamicBody;
+
+        // Chassis
+        b2PolygonShape chassis;
+        chassis.SetAsBox(car_x, car_y);
+        bd.position.Set(car_pos.x, car_pos.y);
+        car_ = m_world->CreateBody(&bd);
+        car_->CreateFixture(&chassis, 0.3f);
+      }
+
+      // Pole
+      {
+        b2BodyDef bd;
+        bd.type = b2_dynamicBody;
+        bd.position.Set(0.0f, car_pos.y + car_y - 0.05f + pole_y);
+
+        b2PolygonShape pole_shape;
+        pole_shape.SetAsBox(pole_x, pole_y);
+        pole_ = m_world->CreateBody(&bd);
+        pole_->CreateFixture(&pole_shape, 0.1f);
+        pole_->ApplyAngularImpulse(init_pole_torque, true);
+
+        b2RevoluteJointDef rd;
+        rd.Initialize(pole_, car_, car_->GetWorldCenter() + b2Vec2{0.0f, car_y - 0.1f});
+        rd.lowerAngle = -0.5f * b2_pi; // -90 degrees
+        rd.upperAngle = 0.5 * b2_pi; // 90 degrees
+        rd.enableLimit = true;
+        rd.maxMotorTorque = 10.0f;
+        rd.motorSpeed = 0.0f;
+        rd.enableMotor = false;
+        pole_joint_ = (b2RevoluteJoint*)m_world->CreateJoint(&rd);
+      }
+
+      // Camera control
+      {
+        g_camera.m_center.y = 0.0f;
+        g_camera.m_center.x = 0.0f;
+      }
+    }
+
+    void Restart() {
+      m_world->DestroyBody(ground_);
+      m_world->DestroyBody(car_);
+      m_world->DestroyBody(pole_);
+      Init();
+    }
+
+    void Keyboard(int key) override {
+      switch (key) {
+        // TODO
+        case GLFW_KEY_A:
+          car_spd_ -= spd_delta_;
+          break;
+
+        case GLFW_KEY_S:
+          car_spd_ = 0.0f;
+          break;
+
+        case GLFW_KEY_D:
+          car_spd_ += spd_delta_;
+          break;
+
+        case GLFW_KEY_Q:
+          break;
+
+        case GLFW_KEY_E:
+          break;
+      }
+    }
+
+    void Step(Settings *settings) override {
+      g_debugDraw.DrawString(5, m_textLine, std::to_string(pole_joint_->GetJointAngle()).c_str());
+
+      if (enable_ai_) {
+        PoleAI::Action action = ai_agent_->GetAction(this);
+        ai_agent_->ApplyAction(action, this);
+      } else {
+        auto v = car_->GetLinearVelocity();
+        car_->SetLinearVelocity({car_spd_, v.y});
+      }
+
+      Test::Step(settings);
+    }
+
+    static Test* Create()
+    {
+      return new MyTest_Pole_Balancing;
+    }
+
+  private:
+    friend class PoleAI;
+    std::unique_ptr<PoleAI> ai_agent_;
+    bool enable_ai_;
+    float car_spd_, spd_delta_;
+    b2Body *car_;
+    b2Body *pole_;
+    b2Body* ground_;
+    b2RevoluteJoint *pole_joint_;
+};
+
+MyTest_Pole_Balancing::MyTest_Pole_Balancing() {
+  ai_agent_ = std::move(std::make_unique<PoleAI>());
+  Init();
+  if(enable_ai_){
+    ai_agent_->LoadActionTable();
+  }
+  //ai_agent_->TrainAI(10, this);
+}
+
+PoleAI::PoleAI() {
+  // 0.99826 ^ 400 = 0.498
+  alpha_ = 0.99826;
+
+  // Initializes action_table_
+  for (int i=0; i<kTableSize; i++) {
+    action_table_[i] = 1;
+  }
+}
+
+PoleAI::Action PoleAI::GetAction(MyTest_Pole_Balancing *instance) {
+  return action_table_[GetActionEntryFromInstance(instance).val];
+}
+
+float PoleAI::EvalAction(const PoleAI::Action &action, MyTest_Pole_Balancing *instance) {
+  ApplyAction(action, instance);
+  instance->m_world->Step(sim_hz_, 8, 4);
+
+  // Runs natrually util game ends or X steps.
+  int step = 0;
+  while (!instance->GameEnd() && step < 5) {
+    instance->m_world->Step(sim_hz_, 8, 4);
+    step++;
+  }
+
+  if(instance->GameEnd()) Print("Game ends: Pole too aggressive.");
+  else Print("Game ends: Step reached.");
+  Print("step: ", step);
+
+  return instance->GameEnd()? step * 100  : -abs(instance->pole_joint_->GetJointAngle());
+}
+
+void PoleAI::TrainAI(int epoches, MyTest_Pole_Balancing *instance) {
+  Print("Training AI...");
+  LoadActionTable();
+  int i = 0;
+  int step = 0;
+  std::string ori_instance = instance->SaveInstanceToString();
+
+  while( i < epoches ) {
+    Print("-------------------");
+    Print("Epoch: ", i);
+    Print("Step: ", step);
+
+    auto table_entry = GetActionEntryFromInstance(instance);
+    Print("t.c_v: ", (int)table_entry.c_v);
+    Print("t.p_a: ", (int)table_entry.p_a);
+    Print("t.p_s: ", (int)table_entry.p_s);
+    Print("val: ", (int)table_entry.val);
+    instance->PrintDebugInfo();
+    Print();
+
+    struct ActionSelect {
+      Action action;
+      float score;
+    } actions[3] = {{0,0.0f}, {1,0.0f}, {2,0.0f}};
+
+    std::string saved_instance = instance->SaveInstanceToString();
+    for(int j=0; j<3; j++){
+      Print("Testing action ", j);
+      actions[j].score = EvalAction(actions[j].action, instance);
+      instance->PrintDebugInfo();
+      Print("Score", j, ": ", actions[j].score);
+      Print("Recovering instance..\n");
+      instance->LoadInstanceFromString(saved_instance);
+    }
+
+    std::sort(actions + 0, actions + 3, [](const ActionSelect &a,
+          const ActionSelect &b){return a.score > b.score;});
+
+    action_table_[table_entry.val] = actions[0].action;
+    ApplyAction(actions[0].action, instance);
+    Print("Choose ", (int)actions[0].action);
+    Print();
+
+    instance->m_world->Step(sim_hz_, 8, 4);
+    step++;
+
+    if (instance->GameEnd() || step >= max_explore_steps_) {
+      Print("Epoch ", i, "  done!\n");
+      std::cout<<"Epoch "<< i << " done!"<< std::endl;
+      instance->Restart();
+      Print("Restarted");
+      instance->PrintDebugInfo();
+      i++;
+      step = 0;
+    }
+  }
+  instance->LoadInstanceFromString(ori_instance);
+
+  Print("Training done!  Saving action table...");
+  SaveActionTable();
+  Print("Saving succeeded!");
+}
+
+PoleAI::ActionTableEntry PoleAI::GetActionEntryFromInstance(MyTest_Pole_Balancing *instance) {
+  b2Body *car = instance->car_;
+  b2RevoluteJoint *pole_joint = instance->pole_joint_;
+
+  float car_v = instance->car_spd_;
+  float pole_ang = instance->pole_joint_->GetJointAngle();
+  float pole_spd = instance->pole_->GetAngularVelocity();
+
+  float car_v_bound = 4.0f;
+  car_v = std::max(car_v, -car_v_bound);
+  car_v = std::min(car_v, car_v_bound);
+
+  float pole_ang_bound = b2_pi/4.0f;
+  pole_ang = std::max(pole_ang, -pole_ang_bound);
+  pole_ang = std::min(pole_ang, pole_ang_bound);
+
+  float pole_spd_bound = 5.0f;
+  pole_spd = std::max(pole_spd, -pole_spd_bound);
+  pole_spd = std::min(pole_spd, pole_spd_bound);
+
+  ActionTableEntry table_entry;
+  table_entry.val = 0;
+  table_entry.c_v = car_v<0?
+    (unsigned int)((car_v_bound+car_v) * kLvl / (2*car_v_bound) - 0.5f): car_v==0? kLvl/2.0f + 1:
+    (unsigned int)(1.0f+kLvl/2 + (car_v * kLvl) / (2*car_v_bound) + 0.5f);
+  table_entry.p_a = pole_ang<0?
+    (unsigned int)((pole_ang_bound+pole_ang) * kLvl / (2*pole_ang_bound) - 0.5f): pole_ang==0? kLvl/2.0f + 1:
+    (unsigned int)(1.0f+kLvl/2 + (pole_ang * kLvl) / (2*pole_ang_bound) + 0.5f);
+  table_entry.p_s = pole_spd<0?
+    (unsigned int) ((pole_spd_bound + pole_spd) * kLvl / (2*pole_spd_bound) - 0.5f): pole_spd==0? kLvl/2.0f + 1:
+    (unsigned int) (1+kLvl/2 + (pole_spd * kLvl) / (2*pole_spd_bound) + 0.5f);
+  return table_entry;
+}
+
+void PoleAI::SaveActionTable() {
+  const char kActionTableFileName[] = "action_table";
+  std::ofstream out(kActionTableFileName);
+  for(int i=0; i<kTableSize; i++) {
+    out<<action_table_[i]<<",";
+  }
+  out.close();
+}
+
+void PoleAI::LoadActionTable() {
+  const char kActionTableFileName[] = "action_table";
+  std::ifstream in(kActionTableFileName);
+  char ch;
+  for(int i=0; i<kTableSize; i++) {
+    in>>action_table_[i]>>ch;
+  }
+  in.close();
+}
+
+void PoleAI::ApplyAction(const Action &action, MyTest_Pole_Balancing *instance) {
+  switch (action) {
+    case 0:
+      instance->car_spd_ -= instance->spd_delta_ * 0.25;
+      break;
+    case 2:
+      instance->car_spd_ += instance->spd_delta_ * 0.25;
+      break;
+    default:
+      break;
+  }
+  auto v = instance->car_->GetLinearVelocity();
+  instance->car_->SetLinearVelocity({instance->car_spd_,v.y});
+}
+
+#endif  // MYTEST_POLE_BALANCING_H
