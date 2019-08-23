@@ -19,6 +19,10 @@
  * each time would then be related to −γK, where K is the number of time steps
  * before failure. In either case, the return is maximized by keeping the pole
  * balanced for as long as possible.
+ *
+ * Wenliang Liu
+ * MTV, CA
+ * 2019.08.22
  */ 
 
 #ifndef MYTEST_POLE_BALANCING_H
